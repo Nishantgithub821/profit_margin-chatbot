@@ -319,27 +319,65 @@ def requested_field(query: str):
     return None
 
 
+
 def search_products(query: str, top_n: int = 5):
-    """Exact/partial name first; fuzzy TF-IDF only when needed."""
+
     q = query.strip().lower()
+
     if not q:
         return products.iloc[0:0].copy(), "empty"
 
+    # Combine brand and product name
+    combined = (
+        products["Brand"].str.lower().str.strip()
+        + " "
+        + products["Product Name"].str.lower().str.strip()
+    )
+
     names = products["Product Name"].str.lower().str.strip()
 
+    # 1. Exact product match
     exact = products[names == q]
-    if not exact.empty:
-        return exact.head(3), "exact"
 
-    partial = products[names.str.contains(re.escape(q), na=False)]
+    if not exact.empty:
+        return exact.head(top_n), "exact"
+
+    # 2. Match full query against brand + product name
+    partial = products[
+        combined.str.contains(re.escape(q), na=False)
+    ]
+
     if not partial.empty:
         return partial.head(top_n), "partial"
 
-    brand_matches = products[products["Brand"].str.lower().str.strip() == q]
-    if not brand_matches.empty:
-        return brand_matches.head(0), "brand_only"
+    # 3. Product name match
+    partial_name = products[
+        names.str.contains(re.escape(q), na=False)
+    ]
 
-    query_vector = product_vectorizer.transform([query.lower()])
+    if not partial_name.empty:
+        return partial_name.head(top_n), "partial"
+
+    # 4. Exact brand search
+    brand_matches = products[
+        products["Brand"].str.lower().str.strip() == q
+    ]
+
+    if not brand_matches.empty:
+        return products.iloc[0:0].copy(), "brand_only"
+
+    # 5. If query contains a model number, do not suggest
+    # a different model through similarity search.
+    model_tokens = [
+        word for word in q.split()
+        if any(char.isdigit() for char in word)
+    ]
+
+    if model_tokens:
+        return products.iloc[0:0].copy(), "not_found"
+
+    # 6. Similarity search only for general queries
+    query_vector = product_vectorizer.transform([q])
     scores = cosine_similarity(query_vector, product_matrix).ravel()
 
     if len(scores) != len(product_df):
@@ -347,14 +385,20 @@ def search_products(query: str, top_n: int = 5):
 
     raw_scores = pd.Series(scores, index=product_df.index)
     sorted_scores = raw_scores.sort_values(ascending=False)
+
     ranked = product_df.loc[sorted_scores.index].copy()
     ranked["_score"] = sorted_scores.values
+
     ranked = ranked[ranked["_score"] >= 0.25]
     ranked = ranked.drop_duplicates(subset=["Brand", "Product Name"])
 
     if ranked.empty:
         return products.iloc[0:0].copy(), "not_found"
+
     return ranked.head(top_n), "similar"
+
+
+   
 
 
 def format_value(field, value):
@@ -367,16 +411,56 @@ def format_value(field, value):
     return str(value)
 
 
+
 def product_summary(row):
+    """Create a readable, properly formatted summary for one matched product."""
+
+    brand = str(row.get("Brand", "Unknown"))
+    product_name = str(row.get("Product Name", "Unknown"))
+
     return (
-        f"**{row.get('Brand', 'Unknown')} {row.get('Product Name', '')}**\n\n"
-        f"- Product type: {row.get('Product Type', 'Not available')}\n"
-        f"- Gender: {row.get('Gender', 'Not available')}\n"
-        f"- Production year: {row.get('Production Year', 'Not available')}\n"
-        f"- Release price: {format_value('Release Price_num', row.get('Release Price_num'))}\n"
-        f"- Profit made: {format_value('Profit Made_num', row.get('Profit Made_num'))}\n"
-        f"- Profit margin: {format_value('Profit Margin_num', row.get('Profit Margin_num'))}"
+        f"### {brand} {product_name}\n\n"
+        f"**Product Type:** {format_value('Product Type', row.get('Product Type'))}  \n"
+        f"**Gender:** {format_value('Gender', row.get('Gender'))}  \n"
+        f"**Production Year:** {format_value('Production Year', row.get('Production Year'))}  \n"
+        f"**Release Price:** {format_value('Release Price_num', row.get('Release Price_num'))}  \n"
+        f"**Profit Made:** {format_value('Profit Made_num', row.get('Profit Made_num'))}  \n"
+        f"**Profit Margin:** {format_value('Profit Margin_num', row.get('Profit Margin_num'))}"
     )
+
+
+def search_by_brand_and_product(brand, product_name):
+
+    # Search only inside the selected brand
+    brand_matches = products[
+        products["Brand"].str.lower().str.strip()
+        == brand.lower().strip()
+    ]
+
+    if brand_matches.empty:
+        return products.iloc[0:0].copy(), "brand_not_found"
+
+    # Clean product name
+    product_query = product_name.lower().strip()
+
+    names = brand_matches["Product Name"].str.lower().str.strip()
+
+    # Exact product name match
+    exact = brand_matches[names == product_query]
+
+    if not exact.empty:
+        return exact, "exact"
+
+    # Partial match, but only within the selected brand
+    partial = brand_matches[
+        names.str.contains(re.escape(product_query), na=False)
+    ]
+
+    if not partial.empty:
+        return partial, "partial"
+
+    return products.iloc[0:0].copy(), "not_found"
+
 
 
 def answer_query(query):
@@ -483,74 +567,141 @@ for col, (label, value) in zip(metric_cols, metric_data):
 st.markdown("")
 
 
+
 # ---------------------------------------------------------
-# CHAT INTERFACE
+# CHAT INTERFACE - TWO STEP BRAND AND PRODUCT SEARCH
 # ---------------------------------------------------------
+
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": (
-                "Hi! I'm ProductIQ. Enter an exact product name and I'll show "
-                "its available details. You can also ask for its price, profit or margin."
-            ),
+            "content": "Welcome to ProductIQ! First, enter the brand name you want to search."
         }
     ]
 
-if "pending_query" not in st.session_state:
-    st.session_state.pending_query = None
+if "search_stage" not in st.session_state:
+    st.session_state.search_stage = "brand"
 
+if "selected_brand" not in st.session_state:
+    st.session_state.selected_brand = None
+
+
+# Display previous messages
 for message in st.session_state.messages:
+
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+
         if message.get("table") is not None:
-            st.dataframe(message["table"], use_container_width=True, hide_index=True)
+            st.dataframe(
+                message["table"],
+                use_container_width=True,
+                hide_index=True
+            )
 
-pending = st.session_state.pending_query
-user_query = st.chat_input("Ask about a product, price, profit or margin...")
 
-if pending:
-    user_query = pending
-    st.session_state.pending_query = None
+# Change input placeholder according to current stage
+if st.session_state.search_stage == "brand":
+    placeholder = "First, enter a brand name..."
+else:
+    placeholder = f"Now enter a {st.session_state.selected_brand} product name..."
+
+
+user_query = st.chat_input(placeholder)
+
 
 if user_query:
-    st.session_state.messages.append({"role": "user", "content": user_query})
 
-    with st.chat_message("user"):
-        st.markdown(user_query)
+    st.session_state.messages.append({
+        "role": "user",
+        "content": user_query
+    })
 
-    answer, selected_row, results = answer_query(user_query)
+    # STEP 1: BRAND SEARCH
+    if st.session_state.search_stage == "brand":
 
-    with st.chat_message("assistant"):
-        st.markdown(answer)
+        available_brands = products["Brand"].str.strip()
 
-        if not results.empty and selected_row is None:
-            view = results[DISPLAY_COLUMNS].copy()
-            st.dataframe(view, use_container_width=True, hide_index=True)
-        elif selected_row is not None:
-            with st.expander("View product record", expanded=False):
-                st.dataframe(
-                    pd.DataFrame([selected_row[DISPLAY_COLUMNS]]),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+        brand_match = available_brands[
+            available_brands.str.lower() == user_query.strip().lower()
+        ]
 
-    table_data = None
-    if not results.empty and selected_row is None:
-        table_data = results[DISPLAY_COLUMNS].copy()
+        if brand_match.empty:
 
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "table": table_data}
-    )
+            response = (
+                f"Brand '{user_query}' was not found. "
+                "Please enter a valid brand name."
+            )
 
+        else:
 
-# ---------------------------------------------------------
-# FOOTER
-# ---------------------------------------------------------
-st.markdown("---")
-st.markdown(
-    '<div class="small-note" style="text-align:center;">'
-    'ProductIQ · Built with Python, Streamlit & TF-IDF · Dataset-powered insights'
-    '</div>',
-    unsafe_allow_html=True,
-)
+            selected_brand = brand_match.iloc[0]
+
+            st.session_state.selected_brand = selected_brand
+            st.session_state.search_stage = "product"
+
+            response = (
+                f"Brand **{selected_brand}** found! "
+                f"Now enter the product name you're looking for."
+            )
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response
+        })
+
+    # STEP 2: PRODUCT SEARCH INSIDE SELECTED BRAND
+    else:
+
+        selected_brand = st.session_state.selected_brand
+
+        results, match_type = search_by_brand_and_product(
+            selected_brand,
+            user_query
+        )
+
+        if results.empty:
+
+            response = (
+                f"No matching product named **{user_query}** "
+                f"was found under **{selected_brand}**. "
+                "Please check the product name and try again."
+            )
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response
+            })
+
+        elif len(results) == 1:
+
+            response = product_summary(results.iloc[0])
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response
+            })
+
+            # Reset for the next search
+            st.session_state.search_stage = "brand"
+            st.session_state.selected_brand = None
+
+        else:
+
+            response = (
+                f"I found multiple matching products under "
+                f"**{selected_brand}**. Please check the results."
+            )
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response,
+                "table": results[DISPLAY_COLUMNS].copy()
+            })
+
+            # Reset for the next search
+            st.session_state.search_stage = "brand"
+            st.session_state.selected_brand = None
+
+    st.rerun()
